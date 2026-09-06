@@ -65,6 +65,7 @@ DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("love", "❤️", "Скажи близким", "что любишь их"),
 ]
 
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")`
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
@@ -367,8 +368,8 @@ async def authenticate(init_data: str) -> int | None:
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def serve_index() -> FileResponse:
-    return FileResponse(os.path.join("static", "index.html"))
-
+    
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 @app.get("/api/state")
 async def api_state(initData: str) -> JSONResponse:
@@ -463,7 +464,7 @@ async def api_tasks_delete(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "tasks": tasks})
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ---------------------------------------------------------------------------
