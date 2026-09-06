@@ -64,8 +64,7 @@ DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("save_money", "💰", "Финансы", "Откладывать деньги / крипта"),
     ("love", "❤️", "Скажи близким", "что любишь их"),
 ]
-
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")`
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"))
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
