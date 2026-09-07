@@ -206,4 +206,527 @@ async def rename_user_task(user_id: int, task_key: str, title: str, hint: str) -
 
 
 async def delete_user_task(user_id: int, task_key: str) -> bool:
-    async with
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM user_tasks WHERE user_id = ? AND task_key = ?",
+            (user_id, task_key),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def save_checkin(user_id: int, day_str: str, states: dict[str, bool]) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        for key, done in states.items():
+            await db.execute(
+                """
+                INSERT INTO checkins (user_id, day, task_key, done)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, day, task_key) DO UPDATE SET done = excluded.done
+                """,
+                (user_id, day_str, key, int(done)),
+            )
+        await db.commit()
+
+
+async def get_existing_checkin(user_id: int, day_str: str) -> dict[str, bool]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT task_key, done FROM checkins WHERE user_id = ? AND day = ?",
+            (user_id, day_str),
+        ) as cur:
+            rows = await cur.fetchall()
+            return {key: bool(done) for key, done in rows}
+
+
+async def get_all_users() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users") as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def count_users() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_all_checkins(user_id: int) -> list[tuple[str, str, int]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT day, task_key, done FROM checkins WHERE user_id = ? ORDER BY day",
+            (user_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Прогресс
+# ---------------------------------------------------------------------------
+async def compute_progress(user_id: int, start_date_str: str, task_keys: list[str]) -> dict:
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    days_elapsed = (date.today() - start_dt).days + 1
+    total_days_planned = TOTAL_WEEKS * 7
+    current_week = min(max((days_elapsed - 1) // 7 + 1, 1), TOTAL_WEEKS)
+
+    rows = await get_all_checkins(user_id)
+    per_task_done: dict[str, int] = {key: 0 for key in task_keys}
+    day_totals: dict[str, int] = {}
+    days_with_data: set[str] = set()
+
+    for day_str, task_key, done in rows:
+        if task_key not in per_task_done:
+            continue
+        days_with_data.add(day_str)
+        if done:
+            per_task_done[task_key] += 1
+            day_totals[day_str] = day_totals.get(day_str, 0) + 1
+
+    perfect_days = sum(1 for d in days_with_data if day_totals.get(d, 0) == len(task_keys))
+    denom = max(len(days_with_data), 1)
+    per_task_pct = {key: round(100 * per_task_done.get(key, 0) / denom) for key in task_keys}
+
+    return {
+        "days_elapsed": min(days_elapsed, total_days_planned),
+        "total_days": total_days_planned,
+        "current_week": current_week,
+        "total_weeks": TOTAL_WEEKS,
+        "days_with_data": len(days_with_data),
+        "perfect_days": perfect_days,
+        "per_task_pct": per_task_pct,
+        "finished": days_elapsed > total_days_planned,
+    }
+
+
+def tasks_description(tasks: list[dict]) -> str:
+    if not tasks:
+        return "Список задач пуст. Добавь через /addtask Название"
+    lines = ["*Твои задачи:*\n"]
+    for i, t in enumerate(tasks, start=1):
+        hint_part = f" — {t['hint']}" if t["hint"] else ""
+        lines.append(f"{i}. {t['emoji']} *{t['title']}*{hint_part}")
+    return "\n".join(lines)
+
+
+def parse_title_hint(text: str) -> tuple[str, str]:
+    if "|" in text:
+        title, hint = text.split("|", 1)
+        return title.strip(), hint.strip()
+    return text.strip(), ""
+
+
+# ---------------------------------------------------------------------------
+# Клавиатура чек-ина
+# ---------------------------------------------------------------------------
+def build_checkin_keyboard(tasks: list[dict], states: dict[str, bool]) -> InlineKeyboardMarkup:
+    rows = []
+    for t in tasks:
+        mark = "✅" if states.get(t["task_key"]) else "⬜"
+        rows.append(
+            [InlineKeyboardButton(text=f"{mark} {t['emoji']} {t['title']}", callback_data=f"toggle:{t['task_key']}")]
+        )
+    rows.append([InlineKeyboardButton(text="💾 Сохранить", callback_data="confirm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_checkin(user_id: int) -> None:
+    tasks = await get_user_tasks(user_id)
+    if not tasks:
+        try:
+            await bot.send_message(user_id, "У тебя пока нет задач. Добавь через /addtask Название")
+        except Exception:
+            logging.exception("Не удалось отправить сообщение пользователю %s", user_id)
+        return
+    today_str = date.today().isoformat()
+    existing = await get_existing_checkin(user_id, today_str)
+    states = {t["task_key"]: existing.get(t["task_key"], False) for t in tasks}
+    try:
+        msg = await bot.send_message(
+            user_id,
+            f"Как прошёл день ({today_str})? Отметь, что выполнил:",
+            reply_markup=build_checkin_keyboard(tasks, states),
+        )
+    except Exception:
+        logging.exception("Не удалось отправить чек-ин пользователю %s", user_id)
+        return
+    pending_checkins[user_id] = {"date": today_str, "states": states, "message_id": msg.message_id}
+
+
+# ---------------------------------------------------------------------------
+# Команды
+# ---------------------------------------------------------------------------
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    user_id = message.from_user.id
+    existing = await get_user(user_id)
+    if existing:
+        total = await count_users() + STATS_BASE_OFFSET
+        await message.answer(
+            f"Ты уже участвуешь в программе! (👥 всего присоединилось: {total})\n\n"
+            "Команды:\n"
+            "/today — отметиться сегодня\n"
+            "/progress — прогресс\n"
+            "/edittasks — изменить задачи (кнопками, легко)\n"
+            "/tasks — список задач\n"
+            "/settime ЧЧ:ММ — время напоминания"
+        )
+        return
+
+    await ensure_user(user_id)
+    tasks = await get_user_tasks(user_id)
+    total = await count_users() + STATS_BASE_OFFSET
+    await message.answer(
+        "Добро пожаловать в *Life Changing Task*!\n\n"
+        f"👥 К программе уже присоединилось: *{total}* человек\n\n"
+        f"Программа на *26 недель (6 месяцев)*. Каждый день в "
+        f"{DEFAULT_HOUR:02d}:{DEFAULT_MINUTE:02d} буду присылать напоминание.\n\n"
+        + tasks_description(tasks)
+        + "\n\nЗадачи можно менять — открой /edittasks и жми кнопки "
+        "(✏️ переименовать, ❌ удалить, ➕ добавить).\n\n"
+        "Отметиться сегодня — /today",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message) -> None:
+    await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    if ADMIN_TELEGRAM_ID and str(message.from_user.id) != ADMIN_TELEGRAM_ID:
+        return  # тихо игнорируем, если задан админ и это не он
+    total = await count_users() + STATS_BASE_OFFSET
+    await message.answer(f"Всего подключилось к программе: *{total}* человек", parse_mode="Markdown")
+
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer(tasks_description(tasks), parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Удобное редактирование задач кнопками (/edittasks)
+# ---------------------------------------------------------------------------
+def build_edit_keyboard(tasks: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for t in tasks:
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"{t['emoji']} {t['title']}", callback_data="noop"),
+                InlineKeyboardButton(text="✏️", callback_data=f"edit:{t['task_key']}"),
+                InlineKeyboardButton(text="❌", callback_data=f"del:{t['task_key']}"),
+            ]
+        )
+    if len(tasks) < MAX_TASKS:
+        rows.append([InlineKeyboardButton(text="➕ Добавить задачу", callback_data="addnew")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("edittasks"))
+async def cmd_edittasks(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await ensure_user(message.from_user.id)
+    tasks = await get_user_tasks(message.from_user.id)
+    if not tasks:
+        await message.answer(
+            "У тебя пока нет задач.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить задачу", callback_data="addnew")]]
+            ),
+        )
+        return
+    await message.answer(
+        "*Твои задачи* — жми ✏️ чтобы переименовать, ❌ чтобы удалить:",
+        parse_mode="Markdown",
+        reply_markup=build_edit_keyboard(tasks),
+    )
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "addnew")
+async def cb_addnew(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TaskEdit.waiting_add)
+    await callback.message.answer(
+        "Напиши название новой задачи (можно с подсказкой через |, например:\n"
+        "Бег | 20 минут утром)"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    task_key = callback.data.split(":", 1)[1]
+    await state.set_state(TaskEdit.waiting_rename)
+    await state.update_data(task_key=task_key)
+    await callback.message.answer(
+        "Напиши новое название для этой задачи (можно с подсказкой через |, например:\n"
+        "Йога | 15 минут вечером)"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_delete(callback: CallbackQuery) -> None:
+    task_key = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    await delete_user_task(user_id, task_key)
+    tasks = await get_user_tasks(user_id)
+    if not tasks:
+        await callback.message.edit_text(
+            "Список задач пуст.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="➕ Добавить задачу", callback_data="addnew")]]
+            ),
+        )
+    else:
+        await callback.message.edit_text(
+            "*Твои задачи* — жми ✏️ чтобы переименовать, ❌ чтобы удалить:",
+            parse_mode="Markdown",
+            reply_markup=build_edit_keyboard(tasks),
+        )
+    await callback.answer("Удалено")
+
+
+@dp.message(TaskEdit.waiting_add, F.text)
+async def process_add_task(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    title, hint = parse_title_hint(message.text)
+    if not title:
+        await message.answer("Название не может быть пустым. Открой /edittasks и попробуй снова.")
+        return
+    task_key = await add_user_task(message.from_user.id, title, hint)
+    if not task_key:
+        await message.answer(f"Уже максимум задач ({MAX_TASKS}) — сначала удали одну.")
+        return
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer(
+        "Добавлено! *Твои задачи:*",
+        parse_mode="Markdown",
+        reply_markup=build_edit_keyboard(tasks),
+    )
+
+
+@dp.message(TaskEdit.waiting_rename, F.text)
+async def process_rename_task(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    task_key = data.get("task_key")
+    await state.clear()
+    title, hint = parse_title_hint(message.text)
+    if not title:
+        await message.answer("Название не может быть пустым. Открой /edittasks и попробуй снова.")
+        return
+    await rename_user_task(message.from_user.id, task_key, title, hint)
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer(
+        "Переименовано! *Твои задачи:*",
+        parse_mode="Markdown",
+        reply_markup=build_edit_keyboard(tasks),
+    )
+
+
+@dp.message(Command("addtask"))
+async def cmd_addtask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        await message.answer("Формат: /addtask Название задачи\nили: /addtask Название | Подсказка")
+        return
+    title, hint = parse_title_hint(text)
+    if not title:
+        await message.answer("Название задачи не может быть пустым.")
+        return
+    task_key = await add_user_task(message.from_user.id, title, hint)
+    if not task_key:
+        await message.answer(f"Уже максимум задач ({MAX_TASKS}) — сначала удали одну через /removetask N")
+        return
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer("Добавлено!\n\n" + tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("removetask"))
+async def cmd_removetask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    arg = message.text.partition(" ")[2].strip()
+    tasks = await get_user_tasks(message.from_user.id)
+    if not arg.isdigit() or not (1 <= int(arg) <= len(tasks)):
+        await message.answer(f"Формат: /removetask N, где N — номер из списка /tasks (1-{len(tasks)})")
+        return
+    index = int(arg) - 1
+    task = tasks[index]
+    await delete_user_task(message.from_user.id, task["task_key"])
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer(f"Удалено: {task['emoji']} {task['title']}\n\n" + tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("renametask"))
+async def cmd_renametask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    rest = message.text.partition(" ")[2].strip()
+    parts = rest.split(" ", 1)
+    tasks = await get_user_tasks(message.from_user.id)
+    if len(parts) < 2 or not parts[0].isdigit() or not (1 <= int(parts[0]) <= len(tasks)):
+        await message.answer(
+            f"Формат: /renametask N Новое название (N — номер из списка /tasks, 1-{len(tasks)})\n"
+            "Можно добавить подсказку через |: /renametask 2 Бег | 20 минут утром"
+        )
+        return
+    index = int(parts[0]) - 1
+    title, hint = parse_title_hint(parts[1])
+    if not title:
+        await message.answer("Название задачи не может быть пустым.")
+        return
+    task = tasks[index]
+    await rename_user_task(message.from_user.id, task["task_key"], title, hint)
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer("Переименовано!\n\n" + tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("today"))
+async def cmd_today(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    await send_checkin(message.from_user.id)
+
+
+@dp.message(Command("settime"))
+async def cmd_settime(message: Message) -> None:
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 2 or ":" not in parts[1]:
+        await message.answer("Формат: /settime 21:30")
+        return
+    try:
+        hour_str, minute_str = parts[1].split(":")
+        hour, minute = int(hour_str), int(minute_str)
+        assert 0 <= hour <= 23 and 0 <= minute <= 59
+    except (ValueError, AssertionError):
+        await message.answer("Не понял время. Формат: /settime 21:30")
+        return
+    await upsert_user(user_id, user["start_date"], hour, minute)
+    schedule_reminder(user_id, hour, minute)
+    await message.answer(f"Готово! Теперь буду писать в {hour:02d}:{minute:02d} каждый день.")
+
+
+@dp.message(Command("progress"))
+async def cmd_progress(message: Message) -> None:
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    tasks = await get_user_tasks(user_id)
+    task_keys = [t["task_key"] for t in tasks]
+    progress = await compute_progress(user_id, user["start_date"], task_keys)
+    lines = [
+        f"*Прогресс: неделя {progress['current_week']} из {progress['total_weeks']}* "
+        f"(день {progress['days_elapsed']} из {progress['total_days']})\n",
+        f"Дней с отметками: {progress['days_with_data']}",
+        f"Идеальных дней: {progress['perfect_days']}\n",
+        "*По задачам (% выполнения):*",
+    ]
+    for t in tasks:
+        lines.append(f"{t['emoji']} {t['title']}: {progress['per_task_pct'].get(t['task_key'], 0)}%")
+    if progress["finished"]:
+        lines.append("\n🎉 Программа на 6 месяцев завершена — поздравляю!")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def cb_toggle(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    pending = pending_checkins.get(user_id)
+    if not pending or callback.message.message_id != pending["message_id"]:
+        await callback.answer("Этот чек-ин устарел, вызови /today ещё раз.", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    pending["states"][key] = not pending["states"].get(key, False)
+    tasks = await get_user_tasks(user_id)
+    await callback.message.edit_reply_markup(reply_markup=build_checkin_keyboard(tasks, pending["states"]))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm")
+async def cb_confirm(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    pending = pending_checkins.get(user_id)
+    if not pending or callback.message.message_id != pending["message_id"]:
+        await callback.answer("Этот чек-ин устарел, вызови /today ещё раз.", show_alert=True)
+        return
+    await save_checkin(user_id, pending["date"], pending["states"])
+    done_count = sum(pending["states"].values())
+    total = len(pending["states"])
+    await callback.message.edit_text(
+        f"Сохранено ✅ Выполнено {done_count} из {total} за {pending['date']}.\n"
+        "Посмотреть прогресс — /progress"
+    )
+    del pending_checkins[user_id]
+    await callback.answer("Сохранено!")
+
+
+# ---------------------------------------------------------------------------
+# Планировщик
+# ---------------------------------------------------------------------------
+def schedule_reminder(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_checkin,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        args=[user_id],
+        id=f"reminder_{user_id}",
+        replace_existing=True,
+    )
+
+
+async def restore_schedules() -> None:
+    for user in await get_all_users():
+        schedule_reminder(user["user_id"], user["reminder_hour"], user["reminder_minute"])
+
+
+# ---------------------------------------------------------------------------
+# Мини-веб-сервер для Render (просто отвечает "OK", чтобы платформа
+# не решила, что сервис завис — без этого хостинг перезапускает бота).
+# Никакого отношения к функциям бота не имеет.
+# ---------------------------------------------------------------------------
+async def handle_health_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        await reader.read(1024)
+        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def run_health_server() -> None:
+    server = await asyncio.start_server(handle_health_connection, "0.0.0.0", PORT)
+    async with server:
+        await server.serve_forever()
+
+
+async def main() -> None:
+    await init_db()
+    await restore_schedules()
+    scheduler.start()
+    await asyncio.gather(
+        run_health_server(),
+        dp.start_polling(bot),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
