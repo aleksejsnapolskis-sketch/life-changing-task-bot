@@ -1,49 +1,44 @@
 """
-Life Changing Task — бот + Telegram Mini App, с редактируемым списком задач.
+Life Changing Task — простой Telegram-бот (без Mini App).
 
-Что нового по сравнению с первой версией:
-- У каждого пользователя теперь СВОЙ список задач (таблица user_tasks),
-  а не общий жёстко зашитый список.
-- При первом запуске (/start) список заполняется 9 задачами по умолчанию
-  (как в исходной таблице), но дальше их можно редактировать, удалять
-  и добавлять свои — максимум MAX_TASKS штук.
-- Управление задачами — прямо в Mini App, вкладка "Мои задачи".
+Трекер 9 задач по умолчанию на 26 недель (6 месяцев), с ежедневными
+напоминаниями. Задачи можно менять прямо командами в чате:
 
-Остальное устройство файла — как в предыдущей версии (см. README.md):
-FastAPI-сервер + Telegram-бот в одном процессе.
+    /tasks               — список текущих задач
+    /addtask Название    — добавить задачу (максимум 10)
+    /addtask Название | Подсказка   — добавить с пояснением
+    /removetask 3        — удалить задачу номер 3 из списка /tasks
+    /renametask 3 Новое название    — переименовать задачу номер 3
+    /renametask 3 Новое название | Подсказка
+
+Остальные команды:
+    /start     — регистрация, включение напоминаний
+    /today     — отметиться за сегодня
+    /progress  — прогресс текстом
+    /settime ЧЧ:ММ — время ежедневного напоминания
+
+Запуск:
+    pip install -r requirements.txt
+    set TELEGRAM_BOT_TOKEN=твой_токен          (Windows)
+    python bot.py
 """
 
 import asyncio
-import hashlib
-import hmac
-import json
 import logging
 import os
 import uuid
 from datetime import date, datetime
-from urllib.parse import parse_qsl
 
 import aiosqlite
-import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    WebAppInfo,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MINI_APP_URL = os.environ.get("MINI_APP_URL", "")
 DB_PATH = os.environ.get("HABITBOT_DB_PATH", "habitbot.sqlite3")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -52,7 +47,6 @@ DEFAULT_HOUR = 21
 DEFAULT_MINUTE = 0
 MAX_TASKS = 10
 
-# Задачи по умолчанию (как в исходной таблице). key, эмодзи, название, подсказка.
 DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("sleep", "😴", "Сон", "Отбой до 23:00 / подъём в 7:00"),
     ("sport", "🏋️", "Спорт", "Зал / бег / прогулка"),
@@ -64,11 +58,10 @@ DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("save_money", "💰", "Финансы", "Откладывать деньги / крипта"),
     ("love", "❤️", "Скажи близким", "что любишь их"),
 ]
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
-app = FastAPI()
 
 pending_checkins: dict[int, dict] = {}
 
@@ -174,7 +167,7 @@ async def get_user_tasks(user_id: int) -> list[dict]:
             return [dict(r) for r in rows]
 
 
-async def add_user_task(user_id: int, title: str, emoji: str, hint: str) -> str | None:
+async def add_user_task(user_id: int, title: str, hint: str) -> str | None:
     tasks = await get_user_tasks(user_id)
     if len(tasks) >= MAX_TASKS:
         return None
@@ -184,22 +177,19 @@ async def add_user_task(user_id: int, title: str, emoji: str, hint: str) -> str 
         await db.execute(
             """
             INSERT INTO user_tasks (user_id, task_key, emoji, title, hint, position)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, '⭐', ?, ?, ?)
             """,
-            (user_id, task_key, emoji or "⭐", title.strip()[:60], hint.strip()[:80], next_position),
+            (user_id, task_key, title.strip()[:60], hint.strip()[:80], next_position),
         )
         await db.commit()
     return task_key
 
 
-async def edit_user_task(user_id: int, task_key: str, title: str, emoji: str, hint: str) -> bool:
+async def rename_user_task(user_id: int, task_key: str, title: str, hint: str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            """
-            UPDATE user_tasks SET title = ?, emoji = ?, hint = ?
-            WHERE user_id = ? AND task_key = ?
-            """,
-            (title.strip()[:60], emoji or "⭐", hint.strip()[:80], user_id, task_key),
+            "UPDATE user_tasks SET title = ?, hint = ? WHERE user_id = ? AND task_key = ?",
+            (title.strip()[:60], hint.strip()[:80], user_id, task_key),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -257,7 +247,7 @@ async def get_all_checkins(user_id: int) -> list[tuple[str, str, int]]:
 
 
 # ---------------------------------------------------------------------------
-# Подсчёт прогресса (теперь на основе персонального списка задач)
+# Прогресс
 # ---------------------------------------------------------------------------
 async def compute_progress(user_id: int, start_date_str: str, task_keys: list[str]) -> dict:
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
@@ -270,40 +260,17 @@ async def compute_progress(user_id: int, start_date_str: str, task_keys: list[st
     day_totals: dict[str, int] = {}
     days_with_data: set[str] = set()
 
-    week_task_done: dict[int, dict[str, int]] = {}
-    week_task_total: dict[int, dict[str, int]] = {}
-
     for day_str, task_key, done in rows:
         if task_key not in per_task_done:
-            continue  # задача с тех пор удалена — в статистику не включаем
+            continue
         days_with_data.add(day_str)
-        day_dt = datetime.strptime(day_str, "%Y-%m-%d").date()
-        day_index = (day_dt - start_dt).days
-        week_num = day_index // 7 + 1
-        if 1 <= week_num <= TOTAL_WEEKS:
-            week_task_total.setdefault(week_num, {k: 0 for k in task_keys})
-            week_task_done.setdefault(week_num, {k: 0 for k in task_keys})
-            week_task_total[week_num][task_key] = week_task_total[week_num].get(task_key, 0) + 1
-            if done:
-                week_task_done[week_num][task_key] = week_task_done[week_num].get(task_key, 0) + 1
         if done:
-            per_task_done[task_key] = per_task_done.get(task_key, 0) + 1
+            per_task_done[task_key] += 1
             day_totals[day_str] = day_totals.get(day_str, 0) + 1
 
     perfect_days = sum(1 for d in days_with_data if day_totals.get(d, 0) == len(task_keys))
     denom = max(len(days_with_data), 1)
     per_task_pct = {key: round(100 * per_task_done.get(key, 0) / denom) for key in task_keys}
-
-    weekly_grid = []
-    for week_num in range(1, current_week + 1):
-        totals = week_task_total.get(week_num, {})
-        dones = week_task_done.get(week_num, {})
-        row = {}
-        for key in task_keys:
-            t = totals.get(key, 0)
-            d = dones.get(key, 0)
-            row[key] = round(100 * d / t) if t else 0
-        weekly_grid.append({"week": week_num, "tasks": row})
 
     return {
         "days_elapsed": min(days_elapsed, total_days_planned),
@@ -313,12 +280,13 @@ async def compute_progress(user_id: int, start_date_str: str, task_keys: list[st
         "days_with_data": len(days_with_data),
         "perfect_days": perfect_days,
         "per_task_pct": per_task_pct,
-        "weekly_grid": weekly_grid,
         "finished": days_elapsed > total_days_planned,
     }
 
 
 def tasks_description(tasks: list[dict]) -> str:
+    if not tasks:
+        return "Список задач пуст. Добавь через /addtask Название"
     lines = ["*Твои задачи:*\n"]
     for i, t in enumerate(tasks, start=1):
         hint_part = f" — {t['hint']}" if t["hint"] else ""
@@ -326,148 +294,15 @@ def tasks_description(tasks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Проверка подписи Telegram WebApp initData
-# ---------------------------------------------------------------------------
-def verify_init_data(init_data: str) -> dict | None:
-    try:
-        pairs = dict(parse_qsl(init_data, strict_parsing=True))
-    except ValueError:
-        return None
-    received_hash = pairs.pop("hash", None)
-    if not received_hash:
-        return None
-    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
-    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(computed_hash, received_hash):
-        return None
-    return pairs
-
-
-def extract_user_id(pairs: dict) -> int | None:
-    user_raw = pairs.get("user")
-    if not user_raw:
-        return None
-    try:
-        return int(json.loads(user_raw)["id"])
-    except (ValueError, KeyError, TypeError):
-        return None
-
-
-async def authenticate(init_data: str) -> int | None:
-    pairs = verify_init_data(init_data)
-    if not pairs:
-        return None
-    return extract_user_id(pairs)
+def parse_title_hint(text: str) -> tuple[str, str]:
+    if "|" in text:
+        title, hint = text.split("|", 1)
+        return title.strip(), hint.strip()
+    return text.strip(), ""
 
 
 # ---------------------------------------------------------------------------
-# FastAPI: страница + API
-# ---------------------------------------------------------------------------
-@app.get("/")
-async def serve_index() -> FileResponse:
-    
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
-
-@app.get("/api/state")
-async def api_state(initData: str) -> JSONResponse:
-    user_id = await authenticate(initData)
-    if not user_id:
-        return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-
-    user = await ensure_user(user_id)
-    tasks = await get_user_tasks(user_id)
-    task_keys = [t["task_key"] for t in tasks]
-    today_str = date.today().isoformat()
-    today_states = await get_existing_checkin(user_id, today_str)
-    progress = await compute_progress(user_id, user["start_date"], task_keys)
-
-    return JSONResponse(
-        {
-            "tasks": tasks,
-            "max_tasks": MAX_TASKS,
-            "today": today_str,
-            "today_states": {k: v for k, v in today_states.items() if k in task_keys},
-            "progress": progress,
-        }
-    )
-
-
-@app.post("/api/checkin")
-async def api_checkin(request: Request) -> JSONResponse:
-    body = await request.json()
-    user_id = await authenticate(body.get("initData", ""))
-    if not user_id:
-        return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-
-    user = await ensure_user(user_id)
-    tasks = await get_user_tasks(user_id)
-    task_keys = [t["task_key"] for t in tasks]
-    states = body.get("states", {})
-    clean_states = {k: bool(v) for k, v in states.items() if k in task_keys}
-    today_str = date.today().isoformat()
-    await save_checkin(user_id, today_str, clean_states)
-    progress = await compute_progress(user_id, user["start_date"], task_keys)
-
-    return JSONResponse({"ok": True, "progress": progress})
-
-
-@app.post("/api/tasks/add")
-async def api_tasks_add(request: Request) -> JSONResponse:
-    body = await request.json()
-    user_id = await authenticate(body.get("initData", ""))
-    if not user_id:
-        return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-    title = (body.get("title") or "").strip()
-    if not title:
-        return JSONResponse({"error": "empty_title"}, status_code=400)
-
-    await ensure_user(user_id)
-    task_key = await add_user_task(user_id, title, body.get("emoji", ""), body.get("hint", ""))
-    if not task_key:
-        return JSONResponse({"error": "limit_reached"}, status_code=400)
-    tasks = await get_user_tasks(user_id)
-    return JSONResponse({"ok": True, "tasks": tasks})
-
-
-@app.post("/api/tasks/edit")
-async def api_tasks_edit(request: Request) -> JSONResponse:
-    body = await request.json()
-    user_id = await authenticate(body.get("initData", ""))
-    if not user_id:
-        return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-    title = (body.get("title") or "").strip()
-    task_key = body.get("task_key", "")
-    if not title or not task_key:
-        return JSONResponse({"error": "bad_request"}, status_code=400)
-
-    ok = await edit_user_task(user_id, task_key, title, body.get("emoji", ""), body.get("hint", ""))
-    if not ok:
-        return JSONResponse({"error": "not_found"}, status_code=404)
-    tasks = await get_user_tasks(user_id)
-    return JSONResponse({"ok": True, "tasks": tasks})
-
-
-@app.post("/api/tasks/delete")
-async def api_tasks_delete(request: Request) -> JSONResponse:
-    body = await request.json()
-    user_id = await authenticate(body.get("initData", ""))
-    if not user_id:
-        return JSONResponse({"error": "invalid_init_data"}, status_code=401)
-    task_key = body.get("task_key", "")
-    ok = await delete_user_task(user_id, task_key)
-    if not ok:
-        return JSONResponse({"error": "not_found"}, status_code=404)
-    tasks = await get_user_tasks(user_id)
-    return JSONResponse({"ok": True, "tasks": tasks})
-
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-# ---------------------------------------------------------------------------
-# Бот: текстовый чек-ин (fallback), теперь тоже по персональному списку
+# Клавиатура чек-ина
 # ---------------------------------------------------------------------------
 def build_checkin_keyboard(tasks: list[dict], states: dict[str, bool]) -> InlineKeyboardMarkup:
     rows = []
@@ -482,27 +317,21 @@ def build_checkin_keyboard(tasks: list[dict], states: dict[str, bool]) -> Inline
 
 async def send_checkin(user_id: int) -> None:
     tasks = await get_user_tasks(user_id)
+    if not tasks:
+        try:
+            await bot.send_message(user_id, "У тебя пока нет задач. Добавь через /addtask Название")
+        except Exception:
+            logging.exception("Не удалось отправить сообщение пользователю %s", user_id)
+        return
     today_str = date.today().isoformat()
     existing = await get_existing_checkin(user_id, today_str)
     states = {t["task_key"]: existing.get(t["task_key"], False) for t in tasks}
     try:
-        if MINI_APP_URL:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="📲 Открыть трекер", web_app=WebAppInfo(url=MINI_APP_URL))]
-                ]
-            )
-            msg = await bot.send_message(
-                user_id,
-                f"Как прошёл день ({today_str})? Открой трекер и отметь, что выполнил:",
-                reply_markup=kb,
-            )
-        else:
-            msg = await bot.send_message(
-                user_id,
-                f"Как прошёл день ({today_str})? Отметь, что выполнил:",
-                reply_markup=build_checkin_keyboard(tasks, states),
-            )
+        msg = await bot.send_message(
+            user_id,
+            f"Как прошёл день ({today_str})? Отметь, что выполнил:",
+            reply_markup=build_checkin_keyboard(tasks, states),
+        )
     except Exception:
         logging.exception("Не удалось отправить чек-ин пользователю %s", user_id)
         return
@@ -510,7 +339,7 @@ async def send_checkin(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Хендлеры команд бота
+# Команды
 # ---------------------------------------------------------------------------
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
@@ -519,49 +348,30 @@ async def cmd_start(message: Message) -> None:
     if existing:
         await message.answer(
             "Ты уже участвуешь в программе! Команды:\n"
-            "/app — открыть трекер (Mini App)\n"
-            "/today — текстовый чек-ин\n"
-            "/progress — прогресс текстом\n"
+            "/today — отметиться сегодня\n"
+            "/progress — прогресс\n"
             "/tasks — список задач\n"
+            "/addtask Название — добавить задачу\n"
+            "/removetask N — удалить задачу номер N\n"
+            "/renametask N Новое название — переименовать\n"
             "/settime ЧЧ:ММ — время напоминания"
         )
         return
 
     await ensure_user(user_id)
     tasks = await get_user_tasks(user_id)
-    text = (
+    await message.answer(
         "Добро пожаловать в *Life Changing Task*!\n\n"
         f"Программа на *26 недель (6 месяцев)*. Каждый день в "
         f"{DEFAULT_HOUR:02d}:{DEFAULT_MINUTE:02d} буду присылать напоминание.\n\n"
         + tasks_description(tasks)
-        + "\n\nЗадачи можно менять под себя (добавлять/удалять/редактировать) "
-        "прямо в трекере, вкладка «Мои задачи»."
+        + "\n\nЗадачи можно менять командами:\n"
+        "/addtask Название — добавить (максимум 10)\n"
+        "/removetask N — удалить задачу номер N из списка /tasks\n"
+        "/renametask N Новое название — переименовать\n\n"
+        "Отметиться сегодня — /today",
+        parse_mode="Markdown",
     )
-    if MINI_APP_URL:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="📲 Открыть трекер", web_app=WebAppInfo(url=MINI_APP_URL))]
-            ]
-        )
-        await message.answer(text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        await message.answer(text + "\n\nОтметиться — /today", parse_mode="Markdown")
-
-
-@dp.message(Command("app"))
-async def cmd_app(message: Message) -> None:
-    if not MINI_APP_URL:
-        await message.answer(
-            "Mini App пока не подключён (нет MINI_APP_URL на сервере). "
-            "Используй /today для текстового чек-ина."
-        )
-        return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📲 Открыть трекер", web_app=WebAppInfo(url=MINI_APP_URL))]
-        ]
-    )
-    await message.answer("Жми, чтобы открыть трекер:", reply_markup=kb)
 
 
 @dp.message(Command("tasks"))
@@ -569,6 +379,63 @@ async def cmd_tasks(message: Message) -> None:
     await ensure_user(message.from_user.id)
     tasks = await get_user_tasks(message.from_user.id)
     await message.answer(tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("addtask"))
+async def cmd_addtask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        await message.answer("Формат: /addtask Название задачи\nили: /addtask Название | Подсказка")
+        return
+    title, hint = parse_title_hint(text)
+    if not title:
+        await message.answer("Название задачи не может быть пустым.")
+        return
+    task_key = await add_user_task(message.from_user.id, title, hint)
+    if not task_key:
+        await message.answer(f"Уже максимум задач ({MAX_TASKS}) — сначала удали одну через /removetask N")
+        return
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer("Добавлено!\n\n" + tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("removetask"))
+async def cmd_removetask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    arg = message.text.partition(" ")[2].strip()
+    tasks = await get_user_tasks(message.from_user.id)
+    if not arg.isdigit() or not (1 <= int(arg) <= len(tasks)):
+        await message.answer(f"Формат: /removetask N, где N — номер из списка /tasks (1-{len(tasks)})")
+        return
+    index = int(arg) - 1
+    task = tasks[index]
+    await delete_user_task(message.from_user.id, task["task_key"])
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer(f"Удалено: {task['emoji']} {task['title']}\n\n" + tasks_description(tasks), parse_mode="Markdown")
+
+
+@dp.message(Command("renametask"))
+async def cmd_renametask(message: Message) -> None:
+    await ensure_user(message.from_user.id)
+    rest = message.text.partition(" ")[2].strip()
+    parts = rest.split(" ", 1)
+    tasks = await get_user_tasks(message.from_user.id)
+    if len(parts) < 2 or not parts[0].isdigit() or not (1 <= int(parts[0]) <= len(tasks)):
+        await message.answer(
+            f"Формат: /renametask N Новое название (N — номер из списка /tasks, 1-{len(tasks)})\n"
+            "Можно добавить подсказку через |: /renametask 2 Бег | 20 минут утром"
+        )
+        return
+    index = int(parts[0]) - 1
+    title, hint = parse_title_hint(parts[1])
+    if not title:
+        await message.answer("Название задачи не может быть пустым.")
+        return
+    task = tasks[index]
+    await rename_user_task(message.from_user.id, task["task_key"], title, hint)
+    tasks = await get_user_tasks(message.from_user.id)
+    await message.answer("Переименовано!\n\n" + tasks_description(tasks), parse_mode="Markdown")
 
 
 @dp.message(Command("today"))
@@ -584,7 +451,6 @@ async def cmd_settime(message: Message) -> None:
     if not user:
         await message.answer("Сначала запусти программу командой /start.")
         return
-
     parts = message.text.strip().split()
     if len(parts) != 2 or ":" not in parts[1]:
         await message.answer("Формат: /settime 21:30")
@@ -596,7 +462,6 @@ async def cmd_settime(message: Message) -> None:
     except (ValueError, AssertionError):
         await message.answer("Не понял время. Формат: /settime 21:30")
         return
-
     await upsert_user(user_id, user["start_date"], hour, minute)
     schedule_reminder(user_id, hour, minute)
     await message.answer(f"Готово! Теперь буду писать в {hour:02d}:{minute:02d} каждый день.")
@@ -609,7 +474,6 @@ async def cmd_progress(message: Message) -> None:
     if not user:
         await message.answer("Сначала запусти программу командой /start.")
         return
-
     tasks = await get_user_tasks(user_id)
     task_keys = [t["task_key"] for t in tasks]
     progress = await compute_progress(user_id, user["start_date"], task_keys)
@@ -660,7 +524,7 @@ async def cb_confirm(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Планировщик напоминаний
+# Планировщик
 # ---------------------------------------------------------------------------
 def schedule_reminder(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
@@ -678,18 +542,34 @@ async def restore_schedules() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Точка входа
+# Мини-веб-сервер для Render (просто отвечает "OK", чтобы платформа
+# не решила, что сервис завис — без этого хостинг перезапускает бота).
+# Никакого отношения к функциям бота не имеет.
 # ---------------------------------------------------------------------------
+async def handle_health_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        await reader.read(1024)
+        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def run_health_server() -> None:
+    server = await asyncio.start_server(handle_health_connection, "0.0.0.0", PORT)
+    async with server:
+        await server.serve_forever()
+
+
 async def main() -> None:
     await init_db()
     await restore_schedules()
     scheduler.start()
-
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
-    server = uvicorn.Server(config)
-
     await asyncio.gather(
-        server.serve(),
+        run_health_server(),
         dp.start_polling(bot),
     )
 
