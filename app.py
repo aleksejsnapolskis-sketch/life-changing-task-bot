@@ -51,6 +51,7 @@ DEFAULT_MINUTE = 0
 MAX_TASKS = 10
 ADMIN_TELEGRAM_ID = os.environ.get("ADMIN_TELEGRAM_ID", "")
 STATS_BASE_OFFSET = 27  # прибавляется к реальному числу пользователей в /stats
+REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")  # например: mychannel (без @)
 
 DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("sleep", "😴", "Сон", "Отбой до 23:00 / подъём в 7:00"),
@@ -356,15 +357,34 @@ async def send_checkin(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Команды
+# Проверка подписки на канал (перед тем как открыть бота)
 # ---------------------------------------------------------------------------
-@dp.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    user_id = message.from_user.id
+async def is_subscribed(user_id: int) -> bool:
+    if not REQUIRED_CHANNEL:
+        return True  # проверка выключена, если канал не задан
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{REQUIRED_CHANNEL}", user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        logging.exception("Не удалось проверить подписку для %s", user_id)
+        return False
+
+
+def subscribe_gate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Открыть канал", url=f"https://t.me/{REQUIRED_CHANNEL}")],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")],
+        ]
+    )
+
+
+async def send_start_content(message_or_callback, user_id: int) -> None:
+    """Отправляет обычное содержимое /start (после прохождения проверки подписки)."""
     existing = await get_user(user_id)
     if existing:
         total = await count_users() + STATS_BASE_OFFSET
-        await message.answer(
+        await message_or_callback.answer(
             f"Ты уже участвуешь в программе! (👥 всего присоединилось: {total})\n\n"
             "Команды:\n"
             "/today — отметиться сегодня\n"
@@ -378,7 +398,7 @@ async def cmd_start(message: Message) -> None:
     await ensure_user(user_id)
     tasks = await get_user_tasks(user_id)
     total = await count_users() + STATS_BASE_OFFSET
-    await message.answer(
+    await message_or_callback.answer(
         "Добро пожаловать в *Life Changing Task*!\n\n"
         f"👥 К программе уже присоединилось: *{total}* человек\n\n"
         f"Программа на *26 недель (6 месяцев)*. Каждый день в "
@@ -389,6 +409,32 @@ async def cmd_start(message: Message) -> None:
         "Отметиться сегодня — /today",
         parse_mode="Markdown",
     )
+
+
+# ---------------------------------------------------------------------------
+# Команды
+# ---------------------------------------------------------------------------
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await is_subscribed(user_id):
+        await message.answer(
+            "Чтобы открыть трекер, сначала подпишись на канал 👇",
+            reply_markup=subscribe_gate_keyboard(),
+        )
+        return
+    await send_start_content(message, user_id)
+
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    if not await is_subscribed(user_id):
+        await callback.answer("Пока не вижу подписку — попробуй ещё раз через пару секунд.", show_alert=True)
+        return
+    await callback.answer("Подписка подтверждена! 🎉")
+    await callback.message.delete()
+    await send_start_content(callback.message, user_id)
 
 
 @dp.message(Command("myid"))
