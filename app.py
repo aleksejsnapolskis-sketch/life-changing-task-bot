@@ -1,3 +1,4 @@
+
 """
 Life Changing Task — простой Telegram-бот (без Mini App).
 
@@ -30,6 +31,7 @@ import uuid
 from datetime import date, datetime
 
 import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -384,14 +386,16 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
     existing = await get_user(user_id)
     if existing:
         total = await count_users() + STATS_BASE_OFFSET
+        tasks = await get_user_tasks(user_id)
         await message_or_callback.answer(
             f"Ты уже участвуешь в программе! (👥 всего присоединилось: {total})\n\n"
-            "Команды:\n"
+            + tasks_description(tasks)
+            + "\n\nКоманды:\n"
             "/today — отметиться сегодня\n"
             "/progress — прогресс\n"
             "/edittasks — изменить задачи (кнопками, легко)\n"
-            "/tasks — список задач\n"
-            "/settime ЧЧ:ММ — время напоминания"
+            "/settime ЧЧ:ММ — время напоминания",
+            parse_mode="Markdown",
         )
         return
 
@@ -744,24 +748,24 @@ async def restore_schedules() -> None:
 # ---------------------------------------------------------------------------
 # Мини-веб-сервер для Render (просто отвечает "OK", чтобы платформа
 # не решила, что сервис завис — без этого хостинг перезапускает бота).
-# Никакого отношения к функциям бота не имеет.
+# Никакого отношения к функциям бота не имеет. Используем aiohttp —
+# надёжную готовую библиотеку, а не самописный обработчик, чтобы правильно
+# отвечать на технические запросы Render и внешнего пинг-сервиса.
 # ---------------------------------------------------------------------------
-async def handle_health_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    try:
-        await reader.read(1024)
-        response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-        writer.write(response)
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        writer.close()
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
 
 
 async def run_health_server() -> None:
-    server = await asyncio.start_server(handle_health_connection, "0.0.0.0", PORT)
-    async with server:
-        await server.serve_forever()
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/{tail:.*}", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    while True:
+        await asyncio.sleep(3600)
 
 
 async def main() -> None:
