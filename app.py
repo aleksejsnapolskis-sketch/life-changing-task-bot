@@ -1,4 +1,3 @@
-
 """
 Life Changing Task — простой Telegram-бот (без Mini App).
 
@@ -50,7 +49,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 TOTAL_WEEKS = 26
 DEFAULT_HOUR = 21
 DEFAULT_MINUTE = 0
-MAX_TASKS = 10
+MAX_TASKS = 12
 ADMIN_TELEGRAM_ID = os.environ.get("ADMIN_TELEGRAM_ID", "")
 STATS_BASE_OFFSET = 27  # прибавляется к реальному числу пользователей в /stats
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")  # например: mychannel (без @)
@@ -410,7 +409,7 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
         + tasks_description(tasks)
         + "\n\nЗадачи можно менять — открой /edittasks и жми кнопки "
         "(✏️ переименовать, ❌ удалить, ➕ добавить).\n\n"
-        "Отметиться сегодня — /today",
+        "Начать сегодня — /today",
         parse_mode="Markdown",
     )
 
