@@ -6,7 +6,7 @@ Life Changing Task — простой Telegram-бот (без Mini App).
 
     /tasks               — список текущих задач
     /addtask Название    — добавить задачу (максимум 10)
-    /addtask Название | Подсказка   — добавить с пояснением
+    /addtask Название|Подсказка   — добавить с пояснением
     /removetask 3        — удалить задачу номер 3 из списка /tasks
     /renametask 3 Новое название    — переименовать задачу номер 3
     /renametask 3 Новое название | Подсказка
@@ -595,7 +595,7 @@ async def cb_addnew(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TaskEdit.waiting_add)
     await callback.message.answer(
         "Напиши название новой задачи (можно с подсказкой через |, например:\n"
-        "Бег | 20 минут утром)"
+        "Бег| 20 минут утром)"
     )
     await callback.answer()
 
@@ -607,7 +607,7 @@ async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(task_key=task_key)
     await callback.message.answer(
         "Напиши новое название для этой задачи (можно с подсказкой через |, например:\n"
-        "Йога | 15 минут вечером)"
+        "Йога| 15 минут вечером)"
     )
     await callback.answer()
 
@@ -689,7 +689,7 @@ async def cmd_addtask(message: Message) -> None:
     await ensure_user(message.from_user.id)
     text = message.text.partition(" ")[2].strip()
     if not text:
-        await message.answer("Формат: /addtask Название задачи\nили: /addtask Название | Подсказка")
+        await message.answer("Формат: /addtask Название задачи\nили: /addtask Название|Подсказка")
         return
     title, hint = parse_title_hint(text)
     if not title:
@@ -727,7 +727,7 @@ async def cmd_renametask(message: Message) -> None:
     if len(parts) < 2 or not parts[0].isdigit() or not (1 <= int(parts[0]) <= len(tasks)):
         await message.answer(
             f"Формат: /renametask N Новое название (N — номер из списка /tasks, 1-{len(tasks)})\n"
-            "Можно добавить подсказку через |: /renametask 2 Бег | 20 минут утром"
+            "Можно добавить подсказку через |: /renametask 2 Бег|20 минут утром"
         )
         return
     index = int(parts[0]) - 1
