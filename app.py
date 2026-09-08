@@ -50,7 +50,7 @@ PORT = int(os.environ.get("PORT", "8000"))
 TOTAL_WEEKS = 26
 DEFAULT_HOUR = 21
 DEFAULT_MINUTE = 0
-MAX_TASKS = 12
+MAX_TASKS = 15
 ADMIN_TELEGRAM_ID = os.environ.get("ADMIN_TELEGRAM_ID", "")
 STATS_BASE_OFFSET = 27  # прибавляется к реальному числу пользователей в /stats
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")  # например: mychannel (без @)
@@ -65,6 +65,7 @@ DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("water", "💧", "Вода", "5 стаканов в день"),
     ("save_money", "💰", "Финансы", "Откладывать деньги / крипта"),
     ("love", "❤️", "Скажи близким", "что любишь их"),
+    ("meditation", "🧘", "Медитация", "15 минут"),
 ]
 
 MOTIVATIONAL_MESSAGES: list[str] = [
