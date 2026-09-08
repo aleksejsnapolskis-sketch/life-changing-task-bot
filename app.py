@@ -26,6 +26,7 @@ Life Changing Task — простой Telegram-бот (без Mini App).
 import asyncio
 import logging
 import os
+import random
 import uuid
 from datetime import date, datetime
 
@@ -66,6 +67,14 @@ DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
     ("love", "❤️", "Скажи близким", "что любишь их"),
 ]
 
+MOTIVATIONAL_MESSAGES: list[str] = [
+    "Ты большой, ты молодец, у тебя всё получится.",
+    "Я в тебя верю, поверь и ты в себя.",
+    "Я благодарен этому миру за всё то, что у меня есть.",
+    "Ты справляешься лучше, чем думаешь — гордись собой.",
+    "Каждый новый день — это шанс стать чуть лучше, чем вчера.",
+]
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
@@ -89,10 +98,27 @@ async def init_db() -> None:
                 user_id INTEGER PRIMARY KEY,
                 start_date TEXT NOT NULL,
                 reminder_hour INTEGER NOT NULL DEFAULT 21,
-                reminder_minute INTEGER NOT NULL DEFAULT 0
+                reminder_minute INTEGER NOT NULL DEFAULT 0,
+                bedtime_hour INTEGER NOT NULL DEFAULT 23,
+                bedtime_minute INTEGER NOT NULL DEFAULT 0,
+                wake_hour INTEGER NOT NULL DEFAULT 7,
+                wake_minute INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        for column, default in (
+            ("bedtime_hour", 23),
+            ("bedtime_minute", 0),
+            ("wake_hour", 7),
+            ("wake_minute", 0),
+        ):
+            try:
+                await db.execute(
+                    f"ALTER TABLE users ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}"
+                )
+                await db.commit()
+            except Exception:
+                pass  # колонка уже есть — это нормально
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_tasks (
@@ -102,10 +128,16 @@ async def init_db() -> None:
                 title TEXT NOT NULL,
                 hint TEXT NOT NULL DEFAULT '',
                 position INTEGER NOT NULL,
+                notify INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (user_id, task_key)
             )
             """
         )
+        try:
+            await db.execute("ALTER TABLE user_tasks ADD COLUMN notify INTEGER NOT NULL DEFAULT 1")
+            await db.commit()
+        except Exception:
+            pass  # колонка уже есть — это нормально
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS checkins (
@@ -143,6 +175,24 @@ async def upsert_user(user_id: int, start_date_str: str, hour: int, minute: int)
         await db.commit()
 
 
+async def set_bedtime(user_id: int, hour: int, minute: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET bedtime_hour = ?, bedtime_minute = ? WHERE user_id = ?",
+            (hour, minute, user_id),
+        )
+        await db.commit()
+
+
+async def set_wake_time(user_id: int, hour: int, minute: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET wake_hour = ?, wake_minute = ? WHERE user_id = ?",
+            (hour, minute, user_id),
+        )
+        await db.commit()
+
+
 async def seed_default_tasks(user_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         for i, (key, emoji, title, hint) in enumerate(DEFAULT_TASKS):
@@ -164,6 +214,8 @@ async def ensure_user(user_id: int) -> dict:
     await upsert_user(user_id, start_str, DEFAULT_HOUR, DEFAULT_MINUTE)
     await seed_default_tasks(user_id)
     schedule_reminder(user_id, DEFAULT_HOUR, DEFAULT_MINUTE)
+    schedule_bedtime(user_id, 23, 0)
+    schedule_wake(user_id, 7, 0)
     return await get_user(user_id)
 
 
@@ -171,12 +223,30 @@ async def get_user_tasks(user_id: int) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT task_key, emoji, title, hint, position FROM user_tasks "
+            "SELECT task_key, emoji, title, hint, position, notify FROM user_tasks "
             "WHERE user_id = ? ORDER BY position",
             (user_id,),
         ) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+async def toggle_task_notify(user_id: int, task_key: str) -> bool | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT notify FROM user_tasks WHERE user_id = ? AND task_key = ?",
+            (user_id, task_key),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        new_value = 0 if row[0] else 1
+        await db.execute(
+            "UPDATE user_tasks SET notify = ? WHERE user_id = ? AND task_key = ?",
+            (new_value, user_id, task_key),
+        )
+        await db.commit()
+        return bool(new_value)
 
 
 async def add_user_task(user_id: int, title: str, hint: str) -> str | None:
@@ -334,21 +404,34 @@ def build_checkin_keyboard(tasks: list[dict], states: dict[str, bool]) -> Inline
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def send_checkin(user_id: int) -> None:
-    tasks = await get_user_tasks(user_id)
-    if not tasks:
+async def send_checkin(user_id: int, automatic: bool = False) -> None:
+    all_tasks = await get_user_tasks(user_id)
+    if not all_tasks:
         try:
             await bot.send_message(user_id, "У тебя пока нет задач. Добавь через /addtask Название")
         except Exception:
             logging.exception("Не удалось отправить сообщение пользователю %s", user_id)
         return
+
+    # Для автоматического (по расписанию) напоминания показываем только
+    # задачи, для которых уведомления не отключены. Для ручного /today —
+    # всегда полный список, чтобы отметить можно было любую задачу.
+    tasks = [t for t in all_tasks if t.get("notify", 1)] if automatic else all_tasks
+    if automatic and not tasks:
+        return  # у пользователя все уведомления отключены — тихо пропускаем
+
     today_str = date.today().isoformat()
     existing = await get_existing_checkin(user_id, today_str)
     states = {t["task_key"]: existing.get(t["task_key"], False) for t in tasks}
+
+    text = f"Как прошёл день ({today_str})? Отметь, что выполнил:"
+    if automatic:
+        text = random.choice(MOTIVATIONAL_MESSAGES) + "\n\n" + text
+
     try:
         msg = await bot.send_message(
             user_id,
-            f"Как прошёл день ({today_str})? Отметь, что выполнил:",
+            text,
             reply_markup=build_checkin_keyboard(tasks, states),
         )
     except Exception:
@@ -393,7 +476,9 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
             "/today — отметиться сегодня\n"
             "/progress — прогресс\n"
             "/edittasks — изменить задачи (кнопками, легко)\n"
-            "/settime ЧЧ:ММ — время напоминания",
+            "/settime ЧЧ:ММ — время напоминания\n"
+            "/setbedtime ЧЧ:ММ — время напоминания об отбое\n"
+            "/setwake ЧЧ:ММ — время напоминания о подъёме",
             parse_mode="Markdown",
         )
         return
@@ -466,9 +551,11 @@ async def cmd_tasks(message: Message) -> None:
 def build_edit_keyboard(tasks: list[dict]) -> InlineKeyboardMarkup:
     rows = []
     for t in tasks:
+        bell = "🔔" if t.get("notify", 1) else "🔕"
         rows.append(
             [
                 InlineKeyboardButton(text=f"{t['emoji']} {t['title']}", callback_data="noop"),
+                InlineKeyboardButton(text=bell, callback_data=f"notify:{t['task_key']}"),
                 InlineKeyboardButton(text="✏️", callback_data=f"edit:{t['task_key']}"),
                 InlineKeyboardButton(text="❌", callback_data=f"del:{t['task_key']}"),
             ]
@@ -492,7 +579,7 @@ async def cmd_edittasks(message: Message, state: FSMContext) -> None:
         )
         return
     await message.answer(
-        "*Твои задачи* — жми ✏️ чтобы переименовать, ❌ чтобы удалить:",
+        "*Твои задачи* — жми 🔔 чтобы вкл/выкл напоминания, ✏️ переименовать, ❌ удалить:",
         parse_mode="Markdown",
         reply_markup=build_edit_keyboard(tasks),
     )
@@ -525,6 +612,19 @@ async def cb_edit(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("notify:"))
+async def cb_toggle_notify(callback: CallbackQuery) -> None:
+    task_key = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    new_state = await toggle_task_notify(user_id, task_key)
+    tasks = await get_user_tasks(user_id)
+    await callback.message.edit_reply_markup(reply_markup=build_edit_keyboard(tasks))
+    if new_state:
+        await callback.answer("🔔 Напоминания включены для этой задачи")
+    else:
+        await callback.answer("🔕 Напоминания отключены для этой задачи")
+
+
 @dp.callback_query(F.data.startswith("del:"))
 async def cb_delete(callback: CallbackQuery) -> None:
     task_key = callback.data.split(":", 1)[1]
@@ -540,7 +640,7 @@ async def cb_delete(callback: CallbackQuery) -> None:
         )
     else:
         await callback.message.edit_text(
-            "*Твои задачи* — жми ✏️ чтобы переименовать, ❌ чтобы удалить:",
+            "*Твои задачи* — жми 🔔 чтобы вкл/выкл напоминания, ✏️ переименовать, ❌ удалить:",
             parse_mode="Markdown",
             reply_markup=build_edit_keyboard(tasks),
         )
@@ -670,6 +770,51 @@ async def cmd_settime(message: Message) -> None:
     await message.answer(f"Готово! Теперь буду писать в {hour:02d}:{minute:02d} каждый день.")
 
 
+def _parse_time_arg(message: Message) -> tuple[int, int] | None:
+    parts = message.text.strip().split()
+    if len(parts) != 2 or ":" not in parts[1]:
+        return None
+    try:
+        hour_str, minute_str = parts[1].split(":")
+        hour, minute = int(hour_str), int(minute_str)
+        assert 0 <= hour <= 23 and 0 <= minute <= 59
+    except (ValueError, AssertionError):
+        return None
+    return hour, minute
+
+
+@dp.message(Command("setbedtime"))
+async def cmd_setbedtime(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await get_user(user_id):
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parsed = _parse_time_arg(message)
+    if not parsed:
+        await message.answer("Формат: /setbedtime 23:00")
+        return
+    hour, minute = parsed
+    await set_bedtime(user_id, hour, minute)
+    schedule_bedtime(user_id, hour, minute)
+    await message.answer(f"Готово! Буду напоминать про отбой в {hour:02d}:{minute:02d}.")
+
+
+@dp.message(Command("setwake"))
+async def cmd_setwake(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await get_user(user_id):
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parsed = _parse_time_arg(message)
+    if not parsed:
+        await message.answer("Формат: /setwake 7:00")
+        return
+    hour, minute = parsed
+    await set_wake_time(user_id, hour, minute)
+    schedule_wake(user_id, hour, minute)
+    await message.answer(f"Готово! Буду напоминать про подъём в {hour:02d}:{minute:02d}.")
+
+
 @dp.message(Command("progress"))
 async def cmd_progress(message: Message) -> None:
     user_id = message.from_user.id
@@ -733,7 +878,7 @@ def schedule_reminder(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_checkin,
         trigger=CronTrigger(hour=hour, minute=minute),
-        args=[user_id],
+        args=[user_id, True],
         id=f"reminder_{user_id}",
         replace_existing=True,
     )
@@ -742,6 +887,46 @@ def schedule_reminder(user_id: int, hour: int, minute: int) -> None:
 async def restore_schedules() -> None:
     for user in await get_all_users():
         schedule_reminder(user["user_id"], user["reminder_hour"], user["reminder_minute"])
+        schedule_bedtime(user["user_id"], user["bedtime_hour"], user["bedtime_minute"])
+        schedule_wake(user["user_id"], user["wake_hour"], user["wake_minute"])
+
+
+# ---------------------------------------------------------------------------
+# Персональные напоминания про сон — у каждого своё время отбоя и подъёма
+# (по умолчанию 23:00 / 7:00, можно поменять командами /setbedtime и /setwake).
+# ---------------------------------------------------------------------------
+async def send_bedtime_reminder(user_id: int) -> None:
+    try:
+        await bot.send_message(user_id, "😴 Пора ложиться спать. Отбой!")
+    except Exception:
+        logging.exception("Не удалось отправить напоминание об отбое пользователю %s", user_id)
+
+
+async def send_wake_reminder(user_id: int) -> None:
+    try:
+        await bot.send_message(user_id, "☀️ Доброе утро, пора вставать!")
+    except Exception:
+        logging.exception("Не удалось отправить напоминание о подъёме пользователю %s", user_id)
+
+
+def schedule_bedtime(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_bedtime_reminder,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        args=[user_id],
+        id=f"bedtime_{user_id}",
+        replace_existing=True,
+    )
+
+
+def schedule_wake(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_wake_reminder,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        args=[user_id],
+        id=f"wake_{user_id}",
+        replace_existing=True,
+    )
 
 
 # ---------------------------------------------------------------------------
