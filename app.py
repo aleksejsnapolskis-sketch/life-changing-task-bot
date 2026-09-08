@@ -647,7 +647,7 @@ async def cb_delete(callback: CallbackQuery) -> None:
     await callback.answer("Удалено")
 
 
-@dp.message(TaskEdit.waiting_add, F.text)
+@dp.message(TaskEdit.waiting_add, F.text, ~F.text.startswith("/"))
 async def process_add_task(message: Message, state: FSMContext) -> None:
     await state.clear()
     title, hint = parse_title_hint(message.text)
@@ -660,13 +660,13 @@ async def process_add_task(message: Message, state: FSMContext) -> None:
         return
     tasks = await get_user_tasks(message.from_user.id)
     await message.answer(
-        "Добавлено! *Твои задачи:*",
+        "✅ Добавлено!\n\n" + tasks_description(tasks),
         parse_mode="Markdown",
         reply_markup=build_edit_keyboard(tasks),
     )
 
 
-@dp.message(TaskEdit.waiting_rename, F.text)
+@dp.message(TaskEdit.waiting_rename, F.text, ~F.text.startswith("/"))
 async def process_rename_task(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     task_key = data.get("task_key")
@@ -678,7 +678,7 @@ async def process_rename_task(message: Message, state: FSMContext) -> None:
     await rename_user_task(message.from_user.id, task_key, title, hint)
     tasks = await get_user_tasks(message.from_user.id)
     await message.answer(
-        "Переименовано! *Твои задачи:*",
+        "✏️ Переименовано!\n\n" + tasks_description(tasks),
         parse_mode="Markdown",
         reply_markup=build_edit_keyboard(tasks),
     )
@@ -742,7 +742,8 @@ async def cmd_renametask(message: Message) -> None:
 
 
 @dp.message(Command("today"))
-async def cmd_today(message: Message) -> None:
+async def cmd_today(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await ensure_user(message.from_user.id)
     await send_checkin(message.from_user.id)
 
