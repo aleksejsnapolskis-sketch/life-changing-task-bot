@@ -29,6 +29,7 @@ import os
 import random
 import uuid
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 from aiohttp import web
@@ -52,6 +53,7 @@ DEFAULT_HOUR = 21
 DEFAULT_MINUTE = 0
 MAX_TASKS = 15
 ADMIN_TELEGRAM_ID = os.environ.get("ADMIN_TELEGRAM_ID", "")
+TIMEZONE = ZoneInfo(os.environ.get("APP_TIMEZONE", "Europe/Riga"))
 STATS_BASE_OFFSET = 27  # прибавляется к реальному числу пользователей в /stats
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")  # например: mychannel (без @)
 
@@ -78,7 +80,7 @@ MOTIVATIONAL_MESSAGES: list[str] = [
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
 
 
 class TaskEdit(StatesGroup):
@@ -103,7 +105,11 @@ async def init_db() -> None:
                 bedtime_hour INTEGER NOT NULL DEFAULT 23,
                 bedtime_minute INTEGER NOT NULL DEFAULT 0,
                 wake_hour INTEGER NOT NULL DEFAULT 7,
-                wake_minute INTEGER NOT NULL DEFAULT 0
+                wake_minute INTEGER NOT NULL DEFAULT 0,
+                water_hour INTEGER NOT NULL DEFAULT 7,
+                water_minute INTEGER NOT NULL DEFAULT 30,
+                motivation_hour INTEGER NOT NULL DEFAULT 8,
+                motivation_minute INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -112,6 +118,10 @@ async def init_db() -> None:
             ("bedtime_minute", 0),
             ("wake_hour", 7),
             ("wake_minute", 0),
+            ("water_hour", 7),
+            ("water_minute", 30),
+            ("motivation_hour", 8),
+            ("motivation_minute", 0),
         ):
             try:
                 await db.execute(
@@ -150,7 +160,29 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY)"
+        )
         await db.commit()
+
+        # Одноразовая правка (выполняется только один раз за всю жизнь базы):
+        # у пользователей, зарегистрированных до того, как мы поставили
+        # мотивацию на 8:00 по умолчанию, время могло остаться старым
+        # (7:00 или 10:00). Подтягиваем их на новое значение один раз —
+        # дальше эта правка больше никогда не запустится, так что личные
+        # настройки людей, поставленные позже, она уже не тронет.
+        migration_name = "motivation_default_to_8am"
+        async with db.execute(
+            "SELECT 1 FROM migrations WHERE name = ?", (migration_name,)
+        ) as cur:
+            already_applied = await cur.fetchone()
+        if not already_applied:
+            await db.execute(
+                "UPDATE users SET motivation_hour = 8, motivation_minute = 0 "
+                "WHERE motivation_hour IN (7, 10) AND motivation_minute = 0"
+            )
+            await db.execute("INSERT INTO migrations (name) VALUES (?)", (migration_name,))
+            await db.commit()
 
 
 async def get_user(user_id: int) -> dict | None:
@@ -194,6 +226,24 @@ async def set_wake_time(user_id: int, hour: int, minute: int) -> None:
         await db.commit()
 
 
+async def set_motivation_time(user_id: int, hour: int, minute: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET motivation_hour = ?, motivation_minute = ? WHERE user_id = ?",
+            (hour, minute, user_id),
+        )
+        await db.commit()
+
+
+async def set_water_time(user_id: int, hour: int, minute: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET water_hour = ?, water_minute = ? WHERE user_id = ?",
+            (hour, minute, user_id),
+        )
+        await db.commit()
+
+
 async def seed_default_tasks(user_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         for i, (key, emoji, title, hint) in enumerate(DEFAULT_TASKS):
@@ -217,6 +267,8 @@ async def ensure_user(user_id: int) -> dict:
     schedule_reminder(user_id, DEFAULT_HOUR, DEFAULT_MINUTE)
     schedule_bedtime(user_id, 23, 0)
     schedule_wake(user_id, 7, 0)
+    schedule_water(user_id, 7, 30)
+    schedule_motivation(user_id, 8, 0)
     return await get_user(user_id)
 
 
@@ -426,8 +478,6 @@ async def send_checkin(user_id: int, automatic: bool = False) -> None:
     states = {t["task_key"]: existing.get(t["task_key"], False) for t in tasks}
 
     text = f"Как прошёл день ({today_str})? Отметь, что выполнил:"
-    if automatic:
-        text = random.choice(MOTIVATIONAL_MESSAGES) + "\n\n" + text
 
     try:
         msg = await bot.send_message(
@@ -468,10 +518,9 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
     """Отправляет обычное содержимое /start (после прохождения проверки подписки)."""
     existing = await get_user(user_id)
     if existing:
-        total = await count_users() + STATS_BASE_OFFSET
         tasks = await get_user_tasks(user_id)
         await message_or_callback.answer(
-            f"Ты уже участвуешь в программе! (👥 всего присоединилось: {total})\n\n"
+            "Ты уже участвуешь в программе!\n\n"
             + tasks_description(tasks)
             + "\n\nКоманды:\n"
             "/today — отметиться сегодня\n"
@@ -479,17 +528,17 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
             "/edittasks — изменить задачи (кнопками, легко)\n"
             "/settime ЧЧ:ММ — время напоминания\n"
             "/setbedtime ЧЧ:ММ — время напоминания об отбое\n"
-            "/setwake ЧЧ:ММ — время напоминания о подъёме",
+            "/setwake ЧЧ:ММ — время напоминания о подъёме\n"
+            "/setmotivation ЧЧ:ММ — время мотивационного сообщения\n"
+            "/setwater ЧЧ:ММ — время напоминания про воду",
             parse_mode="Markdown",
         )
         return
 
     await ensure_user(user_id)
     tasks = await get_user_tasks(user_id)
-    total = await count_users() + STATS_BASE_OFFSET
     await message_or_callback.answer(
         "Добро пожаловать в *Life Changing Task*!\n\n"
-        f"👥 К программе уже присоединилось: *{total}* человек\n\n"
         f"Программа на *26 недель (6 месяцев)*. Каждый день в "
         f"{DEFAULT_HOUR:02d}:{DEFAULT_MINUTE:02d} буду присылать напоминание.\n\n"
         + tasks_description(tasks)
@@ -529,14 +578,6 @@ async def cb_check_sub(callback: CallbackQuery) -> None:
 @dp.message(Command("myid"))
 async def cmd_myid(message: Message) -> None:
     await message.answer(f"Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message) -> None:
-    if ADMIN_TELEGRAM_ID and str(message.from_user.id) != ADMIN_TELEGRAM_ID:
-        return  # тихо игнорируем, если задан админ и это не он
-    total = await count_users() + STATS_BASE_OFFSET
-    await message.answer(f"Всего подключилось к программе: *{total}* человек", parse_mode="Markdown")
 
 
 @dp.message(Command("tasks"))
@@ -817,6 +858,38 @@ async def cmd_setwake(message: Message) -> None:
     await message.answer(f"Готово! Буду напоминать про подъём в {hour:02d}:{minute:02d}.")
 
 
+@dp.message(Command("setmotivation"))
+async def cmd_setmotivation(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await get_user(user_id):
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parsed = _parse_time_arg(message)
+    if not parsed:
+        await message.answer("Формат: /setmotivation 8:00")
+        return
+    hour, minute = parsed
+    await set_motivation_time(user_id, hour, minute)
+    schedule_motivation(user_id, hour, minute)
+    await message.answer(f"Готово! Мотивационное сообщение теперь будет приходить в {hour:02d}:{minute:02d}.")
+
+
+@dp.message(Command("setwater"))
+async def cmd_setwater(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await get_user(user_id):
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parsed = _parse_time_arg(message)
+    if not parsed:
+        await message.answer("Формат: /setwater 7:30")
+        return
+    hour, minute = parsed
+    await set_water_time(user_id, hour, minute)
+    schedule_water(user_id, hour, minute)
+    await message.answer(f"Готово! Напоминание про воду теперь будет приходить в {hour:02d}:{minute:02d}.")
+
+
 @dp.message(Command("progress"))
 async def cmd_progress(message: Message) -> None:
     user_id = message.from_user.id
@@ -891,6 +964,16 @@ async def restore_schedules() -> None:
         schedule_reminder(user["user_id"], user["reminder_hour"], user["reminder_minute"])
         schedule_bedtime(user["user_id"], user["bedtime_hour"], user["bedtime_minute"])
         schedule_wake(user["user_id"], user["wake_hour"], user["wake_minute"])
+        schedule_water(
+            user["user_id"],
+            user.get("water_hour", 7),
+            user.get("water_minute", 30),
+        )
+        schedule_motivation(
+            user["user_id"],
+            user.get("motivation_hour", 8),
+            user.get("motivation_minute", 0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +1010,48 @@ def schedule_wake(user_id: int, hour: int, minute: int) -> None:
         trigger=CronTrigger(hour=hour, minute=minute),
         args=[user_id],
         id=f"wake_{user_id}",
+        replace_existing=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Персональное мотивационное сообщение — отдельно от вечернего чек-ина,
+# по умолчанию в 8:00, можно поменять командой /setmotivation.
+# ---------------------------------------------------------------------------
+async def send_motivation_message(user_id: int) -> None:
+    try:
+        await bot.send_message(user_id, random.choice(MOTIVATIONAL_MESSAGES))
+    except Exception:
+        logging.exception("Не удалось отправить мотивационное сообщение пользователю %s", user_id)
+
+
+def schedule_motivation(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_motivation_message,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        args=[user_id],
+        id=f"motivation_{user_id}",
+        replace_existing=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Напоминание выпить стакан тёплой воды — по умолчанию в 7:30,
+# можно поменять командой /setwater.
+# ---------------------------------------------------------------------------
+async def send_water_reminder(user_id: int) -> None:
+    try:
+        await bot.send_message(user_id, "💧 Пора выпить стакан тёплой воды!")
+    except Exception:
+        logging.exception("Не удалось отправить напоминание про воду пользователю %s", user_id)
+
+
+def schedule_water(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_water_reminder,
+        trigger=CronTrigger(hour=hour, minute=minute),
+        args=[user_id],
+        id=f"water_{user_id}",
         replace_existing=True,
     )
 
