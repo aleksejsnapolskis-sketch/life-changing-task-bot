@@ -58,7 +58,7 @@ STATS_BASE_OFFSET = 27  # прибавляется к реальному чис�
 REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")  # например: mychannel (без @)
 
 DEFAULT_TASKS: list[tuple[str, str, str, str]] = [
-    ("sleep", "😴", "Сон", "Отбой до 23:00 / подъём в 7:00"),
+    ("sleep", "😴", "Сон", "Отбой до 23:00 / подъём в 9:00"),
     ("sport", "🏋️", "Спорт", "Зал / бег / прогулка"),
     ("cold_shower", "🚿", "Холодный душ", "+ медитация 15 мин"),
     ("reading", "📖", "Чтение", "Книга / подкаст"),
@@ -104,10 +104,10 @@ async def init_db() -> None:
                 reminder_minute INTEGER NOT NULL DEFAULT 0,
                 bedtime_hour INTEGER NOT NULL DEFAULT 23,
                 bedtime_minute INTEGER NOT NULL DEFAULT 0,
-                wake_hour INTEGER NOT NULL DEFAULT 7,
+                wake_hour INTEGER NOT NULL DEFAULT 9,
                 wake_minute INTEGER NOT NULL DEFAULT 0,
-                water_hour INTEGER NOT NULL DEFAULT 7,
-                water_minute INTEGER NOT NULL DEFAULT 30,
+                water_hour INTEGER NOT NULL DEFAULT 9,
+                water_minute INTEGER NOT NULL DEFAULT 0,
                 motivation_hour INTEGER NOT NULL DEFAULT 8,
                 motivation_minute INTEGER NOT NULL DEFAULT 0
             )
@@ -116,10 +116,10 @@ async def init_db() -> None:
         for column, default in (
             ("bedtime_hour", 23),
             ("bedtime_minute", 0),
-            ("wake_hour", 7),
+            ("wake_hour", 9),
             ("wake_minute", 0),
-            ("water_hour", 7),
-            ("water_minute", 30),
+            ("water_hour", 9),
+            ("water_minute", 0),
             ("motivation_hour", 8),
             ("motivation_minute", 0),
         ):
@@ -180,6 +180,26 @@ async def init_db() -> None:
             await db.execute(
                 "UPDATE users SET motivation_hour = 8, motivation_minute = 0 "
                 "WHERE motivation_hour IN (7, 10) AND motivation_minute = 0"
+            )
+            await db.execute("INSERT INTO migrations (name) VALUES (?)", (migration_name,))
+            await db.commit()
+
+        # Одноразовая правка: подъём и тёплая вода переезжают с 7:00 / 7:30
+        # на 9:00 по рижскому времени. Трогаем только тех, у кого стояли
+        # старые значения по умолчанию — личные настройки не меняем.
+        migration_name = "wake_water_default_to_9am"
+        async with db.execute(
+            "SELECT 1 FROM migrations WHERE name = ?", (migration_name,)
+        ) as cur:
+            already_applied = await cur.fetchone()
+        if not already_applied:
+            await db.execute(
+                "UPDATE users SET wake_hour = 9, wake_minute = 0 "
+                "WHERE wake_hour = 7 AND wake_minute = 0"
+            )
+            await db.execute(
+                "UPDATE users SET water_hour = 9, water_minute = 0 "
+                "WHERE water_hour = 7 AND water_minute = 30"
             )
             await db.execute("INSERT INTO migrations (name) VALUES (?)", (migration_name,))
             await db.commit()
@@ -261,13 +281,13 @@ async def ensure_user(user_id: int) -> dict:
     user = await get_user(user_id)
     if user:
         return user
-    start_str = date.today().isoformat()
+    start_str = datetime.now(TIMEZONE).date().isoformat()
     await upsert_user(user_id, start_str, DEFAULT_HOUR, DEFAULT_MINUTE)
     await seed_default_tasks(user_id)
     schedule_reminder(user_id, DEFAULT_HOUR, DEFAULT_MINUTE)
     schedule_bedtime(user_id, 23, 0)
-    schedule_wake(user_id, 7, 0)
-    schedule_water(user_id, 7, 30)
+    schedule_wake(user_id, 9, 0)
+    schedule_water(user_id, 9, 0)
     schedule_motivation(user_id, 8, 0)
     return await get_user(user_id)
 
@@ -393,7 +413,7 @@ async def get_all_checkins(user_id: int) -> list[tuple[str, str, int]]:
 # ---------------------------------------------------------------------------
 async def compute_progress(user_id: int, start_date_str: str, task_keys: list[str]) -> dict:
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-    days_elapsed = (date.today() - start_dt).days + 1
+    days_elapsed = (datetime.now(TIMEZONE).date() - start_dt).days + 1
     total_days_planned = TOTAL_WEEKS * 7
     current_week = min(max((days_elapsed - 1) // 7 + 1, 1), TOTAL_WEEKS)
 
@@ -473,7 +493,7 @@ async def send_checkin(user_id: int, automatic: bool = False) -> None:
     if automatic and not tasks:
         return  # у пользователя все уведомления отключены — тихо пропускаем
 
-    today_str = date.today().isoformat()
+    today_str = datetime.now(TIMEZONE).date().isoformat()
     existing = await get_existing_checkin(user_id, today_str)
     states = {t["task_key"]: existing.get(t["task_key"], False) for t in tasks}
 
@@ -952,7 +972,7 @@ async def cb_confirm(callback: CallbackQuery) -> None:
 def schedule_reminder(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_checkin,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id, True],
         id=f"reminder_{user_id}",
         replace_existing=True,
@@ -966,8 +986,8 @@ async def restore_schedules() -> None:
         schedule_wake(user["user_id"], user["wake_hour"], user["wake_minute"])
         schedule_water(
             user["user_id"],
-            user.get("water_hour", 7),
-            user.get("water_minute", 30),
+            user.get("water_hour", 9),
+            user.get("water_minute", 0),
         )
         schedule_motivation(
             user["user_id"],
@@ -978,7 +998,7 @@ async def restore_schedules() -> None:
 
 # ---------------------------------------------------------------------------
 # Персональные напоминания про сон — у каждого своё время отбоя и подъёма
-# (по умолчанию 23:00 / 7:00, можно поменять командами /setbedtime и /setwake).
+# (по умолчанию 23:00 / 9:00, можно поменять командами /setbedtime и /setwake).
 # ---------------------------------------------------------------------------
 async def send_bedtime_reminder(user_id: int) -> None:
     try:
@@ -997,7 +1017,7 @@ async def send_wake_reminder(user_id: int) -> None:
 def schedule_bedtime(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_bedtime_reminder,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id],
         id=f"bedtime_{user_id}",
         replace_existing=True,
@@ -1007,7 +1027,7 @@ def schedule_bedtime(user_id: int, hour: int, minute: int) -> None:
 def schedule_wake(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_wake_reminder,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id],
         id=f"wake_{user_id}",
         replace_existing=True,
@@ -1028,7 +1048,7 @@ async def send_motivation_message(user_id: int) -> None:
 def schedule_motivation(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_motivation_message,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id],
         id=f"motivation_{user_id}",
         replace_existing=True,
@@ -1036,7 +1056,7 @@ def schedule_motivation(user_id: int, hour: int, minute: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Напоминание выпить стакан тёплой воды — по умолчанию в 7:30,
+# Напоминание выпить стакан тёплой воды — по умолчанию в 9:00,
 # можно поменять командой /setwater.
 # ---------------------------------------------------------------------------
 async def send_water_reminder(user_id: int) -> None:
@@ -1049,7 +1069,7 @@ async def send_water_reminder(user_id: int) -> None:
 def schedule_water(user_id: int, hour: int, minute: int) -> None:
     scheduler.add_job(
         send_water_reminder,
-        trigger=CronTrigger(hour=hour, minute=minute),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id],
         id=f"water_{user_id}",
         replace_existing=True,
