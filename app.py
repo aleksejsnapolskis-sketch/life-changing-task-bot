@@ -109,7 +109,9 @@ async def init_db() -> None:
                 water_hour INTEGER NOT NULL DEFAULT 9,
                 water_minute INTEGER NOT NULL DEFAULT 0,
                 motivation_hour INTEGER NOT NULL DEFAULT 8,
-                motivation_minute INTEGER NOT NULL DEFAULT 0
+                motivation_minute INTEGER NOT NULL DEFAULT 0,
+                social_hour INTEGER NOT NULL DEFAULT 13,
+                social_minute INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -122,6 +124,8 @@ async def init_db() -> None:
             ("water_minute", 0),
             ("motivation_hour", 8),
             ("motivation_minute", 0),
+            ("social_hour", 13),
+            ("social_minute", 0),
         ):
             try:
                 await db.execute(
@@ -255,6 +259,15 @@ async def set_motivation_time(user_id: int, hour: int, minute: int) -> None:
         await db.commit()
 
 
+async def set_social_time(user_id: int, hour: int, minute: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET social_hour = ?, social_minute = ? WHERE user_id = ?",
+            (hour, minute, user_id),
+        )
+        await db.commit()
+
+
 async def set_water_time(user_id: int, hour: int, minute: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -288,6 +301,7 @@ async def ensure_user(user_id: int) -> dict:
     schedule_bedtime(user_id, 23, 0)
     schedule_wake(user_id, 9, 0)
     schedule_water(user_id, 9, 0)
+    schedule_social(user_id, 13, 0)
     schedule_motivation(user_id, 8, 0)
     return await get_user(user_id)
 
@@ -550,7 +564,8 @@ async def send_start_content(message_or_callback, user_id: int) -> None:
             "/setbedtime ЧЧ:ММ — время напоминания об отбое\n"
             "/setwake ЧЧ:ММ — время напоминания о подъёме\n"
             "/setmotivation ЧЧ:ММ — время мотивационного сообщения\n"
-            "/setwater ЧЧ:ММ — время напоминания про воду",
+            "/setwater ЧЧ:ММ — время напоминания про воду\n"
+            "/setsocial ЧЧ:ММ — время напоминания «хватит сидеть в соцсетях»",
             parse_mode="Markdown",
         )
         return
@@ -894,6 +909,22 @@ async def cmd_setmotivation(message: Message) -> None:
     await message.answer(f"Готово! Мотивационное сообщение теперь будет приходить в {hour:02d}:{minute:02d}.")
 
 
+@dp.message(Command("setsocial"))
+async def cmd_setsocial(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await get_user(user_id):
+        await message.answer("Сначала запусти программу командой /start.")
+        return
+    parsed = _parse_time_arg(message)
+    if not parsed:
+        await message.answer("Формат: /setsocial 13:00")
+        return
+    hour, minute = parsed
+    await set_social_time(user_id, hour, minute)
+    schedule_social(user_id, hour, minute)
+    await message.answer(f"Готово! Напоминание про соцсети теперь будет приходить в {hour:02d}:{minute:02d}.")
+
+
 @dp.message(Command("setwater"))
 async def cmd_setwater(message: Message) -> None:
     user_id = message.from_user.id
@@ -989,6 +1020,11 @@ async def restore_schedules() -> None:
             user.get("water_hour", 9),
             user.get("water_minute", 0),
         )
+        schedule_social(
+            user["user_id"],
+            user.get("social_hour", 13),
+            user.get("social_minute", 0),
+        )
         schedule_motivation(
             user["user_id"],
             user.get("motivation_hour", 8),
@@ -1072,6 +1108,27 @@ def schedule_water(user_id: int, hour: int, minute: int) -> None:
         trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
         args=[user_id],
         id=f"water_{user_id}",
+        replace_existing=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Напоминание в середине дня отложить телефон — по умолчанию в 13:00,
+# можно поменять командой /setsocial.
+# ---------------------------------------------------------------------------
+async def send_social_reminder(user_id: int) -> None:
+    try:
+        await bot.send_message(user_id, "📵 Хватит сидеть в соцсетях! Отложи телефон и займись делом.")
+    except Exception:
+        logging.exception("Не удалось отправить напоминание про соцсети пользователю %s", user_id)
+
+
+def schedule_social(user_id: int, hour: int, minute: int) -> None:
+    scheduler.add_job(
+        send_social_reminder,
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=TIMEZONE),
+        args=[user_id],
+        id=f"social_{user_id}",
         replace_existing=True,
     )
 
